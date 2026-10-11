@@ -423,10 +423,20 @@ pub(super) fn parse_conemu_working_directory(params: &[&[u8]]) -> Option<String>
 }
 
 /// Whether `path` is absolute in either flavor a cwd report can carry:
-/// a POSIX `/` root or a Windows drive-letter root. UNC (`\\server`)
-/// is refused: it names another machine, which the host-checked OSC 7
-/// flavors refuse too.
+/// a POSIX `/` root or a Windows drive-letter root. Only local WSL
+/// shares are accepted as UNC paths; other servers remain refused.
 fn is_absolute_path(path: &str) -> bool {
+    if let Some(unc) = path.strip_prefix("\\\\") {
+        let mut parts = unc.splitn(3, '\\');
+        let host = parts.next().unwrap_or_default();
+        let distribution = parts.next().unwrap_or_default();
+        return (host.eq_ignore_ascii_case("wsl.localhost")
+            || host.eq_ignore_ascii_case("wsl$"))
+            && !distribution.is_empty()
+            && distribution != "."
+            && distribution != ".."
+            && parts.next().is_some();
+    }
     if path.starts_with('/') {
         return true;
     }
@@ -609,6 +619,11 @@ mod tests {
         assert_eq!(parse(&[b"9", b"9", b"Meeting at 5"]), None);
         assert_eq!(parse(&[b"9", b"9", b"..\\up"]), None);
         assert_eq!(parse(&[b"9", b"9", b"\\\\server\\share"]), None);
+        for path in [r"\\wsl.localhost\Ubuntu\home\user", r"\\wsl$\Ubuntu\"] {
+            assert_eq!(parse(&[b"9", b"9", path.as_bytes()]), Some(path.into()));
+        }
+        assert_eq!(parse(&[b"9", b"9", br"\\wsl.localhost\Ubuntu"]), None);
+        assert_eq!(parse(&[b"9", b"9", br"\\wsl.localhost\\home"]), None);
         assert_eq!(
             parse(&[b"9", b"9", b"/home/user"]),
             Some("/home/user".into())
@@ -766,6 +781,19 @@ mod tests {
         assert_eq!(
             term.current_directory.as_deref(),
             Some(std::path::Path::new("/home/My Files"))
+        );
+
+        // The existing WSL zsh hook emits OSC 9;9 with a wslpath UNC name.
+        processor.advance(
+            &mut term,
+            "\x1b]9;9;\\\\wsl.localhost\\Ubuntu\\home\\папка с пробелами\x1b\\"
+                .as_bytes(),
+        );
+        assert_eq!(
+            term.current_directory.as_deref(),
+            Some(std::path::Path::new(
+                r"\\wsl.localhost\Ubuntu\home\папка с пробелами"
+            ))
         );
     }
 }

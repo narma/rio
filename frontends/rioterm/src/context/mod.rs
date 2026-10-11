@@ -1,5 +1,7 @@
 pub mod renderable;
 pub mod title;
+#[cfg(windows)]
+mod windows;
 
 use crate::ansi::CursorShape;
 use crate::context::title::{update_title, ContextTitle};
@@ -1210,39 +1212,48 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
         self.set_current(target);
     }
 
+    /// Derive a fresh spawn config from the focused pane, without changing
+    /// the configured startup directory used by the first tab.
+    fn inherited_config(&self) -> ContextManagerConfig {
+        let mut config = self.config.clone();
+        if !config.cwd {
+            return config;
+        }
+        let current = self.current();
+        let reported = current.terminal.lock().current_directory.clone();
+        #[cfg(windows)]
+        if let Some(path) = reported {
+            let path = path.to_string_lossy();
+            if !windows::inherit_directory(&mut config.shell, &path) {
+                // A Linux path is not a valid CreateProcessW working directory.
+                if path.len() >= 3 && path.as_bytes()[1] == b':' {
+                    config.working_dir = Some(path.into_owned());
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let path = reported.or_else(|| {
+                teletypewriter::foreground_process_path(
+                    *current.main_fd,
+                    current.shell_pid,
+                )
+                .ok()
+            });
+            if let Some(path) = path {
+                config.working_dir = Some(path.to_string_lossy().into_owned());
+            }
+        }
+        config
+    }
+
     pub fn split(
         &mut self,
         rich_text_id: usize,
         split_down: bool,
         sugarloaf: &mut Sugarloaf,
     ) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
-
-        let mut cloned_config = self.config.clone();
-        if working_dir.is_some() {
-            cloned_config.working_dir = working_dir;
-        }
+        let cloned_config = self.inherited_config();
 
         let current = self.current();
         let cursor = current.cursor_from_ref();
@@ -1338,43 +1349,19 @@ impl<T: EventListener + Clone + std::marker::Send + 'static> ContextManager<T> {
 
     #[inline]
     pub fn add_context(&mut self, redirect: bool, rich_text_id: usize) {
-        let mut working_dir = self.config.working_dir.clone();
-        if self.config.cwd {
-            #[cfg(not(target_os = "windows"))]
-            {
-                let current_context = self.current();
-                if let Ok(path) = teletypewriter::foreground_process_path(
-                    *current_context.main_fd,
-                    current_context.shell_pid,
-                ) {
-                    working_dir = Some(path.to_string_lossy().to_string());
-                }
-            }
-
-            #[cfg(target_os = "windows")]
-            {
-                // if let Ok(path) = teletypewriter::foreground_process_path() {
-                //     working_dir =
-                //         Some(path.to_string_lossy().to_string());
-                // }
-                working_dir = None;
-            }
-        }
+        let cloned_config = self.inherited_config();
 
         if self.config.is_native {
-            self.event_proxy
-                .send_event(RioEvent::CreateNativeTab(working_dir), self.window_id);
+            self.event_proxy.send_event(
+                RioEvent::CreateNativeTab(cloned_config.working_dir),
+                self.window_id,
+            );
             return;
         }
 
         let size = self.contexts.len();
         if size < self.capacity {
             let last_index = self.contexts.len();
-
-            let mut cloned_config = self.config.clone();
-            if working_dir.is_some() {
-                cloned_config.working_dir = working_dir;
-            }
 
             let current = self.current();
             let cursor = current.cursor_from_ref();
@@ -1480,6 +1467,47 @@ pub fn process_open_url(
 pub mod test {
     use super::*;
     use crate::event::VoidListener;
+
+    #[test]
+    fn inheritance_uses_focused_tab_and_respects_opt_out() {
+        let mut manager =
+            ContextManager::start_with_capacity(5, VoidListener {}, WindowId::from(0))
+                .unwrap();
+        manager.config.cwd = true;
+        manager.config.working_dir = Some("configured-startup".into());
+        manager.config.shell = Shell {
+            program: Some("wsl.exe".into()),
+            args: vec!["--cd".into(), "~".into()],
+        };
+        assert_eq!(manager.inherited_config().shell.args, ["--cd", "~"]);
+        manager.current().terminal.lock().current_directory =
+            Some(r"\\wsl.localhost\Ubuntu\home\first".into());
+        #[cfg(windows)]
+        assert_eq!(
+            manager.inherited_config().shell.args,
+            ["--cd", "/home/first", "--distribution", "Ubuntu"]
+        );
+        manager.add_context(true, 1);
+        manager.current().terminal.lock().current_directory =
+            Some(r"\\wsl.localhost\Ubuntu\home\second".into());
+        #[cfg(windows)]
+        assert_eq!(
+            manager.inherited_config().shell.args,
+            ["--cd", "/home/second", "--distribution", "Ubuntu"]
+        );
+        manager.select_tab(0);
+        #[cfg(windows)]
+        assert_eq!(
+            manager.inherited_config().shell.args,
+            ["--cd", "/home/first", "--distribution", "Ubuntu"]
+        );
+        manager.config.cwd = false;
+        assert_eq!(manager.inherited_config().shell.args, ["--cd", "~"]);
+        assert_eq!(
+            manager.inherited_config().working_dir.as_deref(),
+            Some("configured-startup")
+        );
+    }
 
     #[test]
     fn test_capacity() {

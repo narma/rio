@@ -48,12 +48,61 @@ pub fn create_pty(
 ) -> Result<Pty, std::io::Error> {
     let exec = shell.map(|shell| {
         if args.is_empty() {
-            shell.to_string()
+            quote_argument(shell)
         } else {
-            format!("{shell} {}", args.join(" "))
+            format!(
+                "{} {}",
+                quote_argument(shell),
+                args.iter()
+                    .map(|arg| quote_argument(arg))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
         }
     });
     conpty::new(exec.as_deref(), working_directory, env, columns, rows)
+}
+
+/// Encode one argv element for the Windows C runtime command-line parser.
+/// Backslashes must be doubled before quotes and before the closing quote.
+fn quote_argument(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\r', '"']) {
+        return arg.to_owned();
+    }
+    let mut result = String::from("\"");
+    let mut slashes = 0;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            slashes += 1;
+            continue;
+        }
+        result.extend(std::iter::repeat_n(
+            '\\',
+            if ch == '"' { slashes * 2 + 1 } else { slashes },
+        ));
+        result.push(ch);
+        slashes = 0;
+    }
+    result.extend(std::iter::repeat_n('\\', slashes * 2));
+    result.push('"');
+    result
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::quote_argument;
+
+    #[test]
+    fn quotes_directory_arguments() {
+        assert_eq!(quote_argument(""), "\"\"");
+        assert_eq!(
+            quote_argument("/home/user/папка с пробелами"),
+            "\"/home/user/папка с пробелами\""
+        );
+        assert_eq!(quote_argument("D:\\my project\\"), "\"D:\\my project\\\\\"");
+        assert_eq!(quote_argument("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote_argument("--cd"), "--cd");
+    }
 }
 
 impl Pty {
