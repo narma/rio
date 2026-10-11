@@ -19,6 +19,9 @@
 //! has a machine-wide registry key) are left untouched, and every
 //! integrated pane exports `RIO_SHELL_INTEGRATION` pointing at the
 //! script directory so any shell can source the integration manually.
+//! On Windows, wsl.exe launches forward the zsh script directory through
+//! WSLENV with path translation. WSL zsh reports OSC 9;9 local-share paths
+//! using builtins, so no user .zshrc changes or per-prompt processes are needed.
 //!
 //! Old versions' script directories are deliberately left in place: a
 //! concurrently running older rio still spawns shells whose `ZDOTDIR`
@@ -62,8 +65,52 @@ pub fn prepare(shell_program: Option<&str>, args: &[String]) -> SpawnIntegration
         "RIO_SHELL_INTEGRATION".to_string(),
         dir.to_string_lossy().to_string(),
     ));
+    #[cfg(windows)]
+    if shell_name == "wsl" {
+        env.extend(wsl_env_pairs(
+            dir,
+            std::env::var("WSLENV").ok().as_deref(),
+            std::env::var("ZDOTDIR").ok(),
+        ));
+    }
     let command = powershell_command(&shell_name, shell_program, &program, args);
     SpawnIntegration { env, command }
+}
+
+/// WSL translates the script directory itself; no helper process is needed.
+/// Zsh loads our .zshenv, which restores ZDOTDIR before loading user config.
+/// The /u flag limits these entries to Windows -> WSL launches.
+#[cfg(windows)]
+fn wsl_env_pairs(
+    dir: &Path,
+    current_wslenv: Option<&str>,
+    current_zdotdir: Option<String>,
+) -> Vec<(String, String)> {
+    let mut entries: Vec<&str> = current_wslenv
+        .unwrap_or_default()
+        .split(':')
+        .filter(|entry| {
+            let name = entry.split('/').next().unwrap_or_default();
+            !name.is_empty()
+                && !["ZDOTDIR", "RIO_ZSH_ZDOTDIR", "RIO_WSL_INTEGRATION"]
+                    .iter()
+                    .any(|ours| name.eq_ignore_ascii_case(ours))
+        })
+        .collect();
+    entries.extend(["ZDOTDIR/pu", "RIO_WSL_INTEGRATION/u"]);
+    let mut env = vec![
+        (
+            "ZDOTDIR".into(),
+            dir.join("zsh").to_string_lossy().into_owned(),
+        ),
+        ("RIO_WSL_INTEGRATION".into(), "1".into()),
+    ];
+    if let Some(original) = current_zdotdir {
+        env.push(("RIO_ZSH_ZDOTDIR".into(), original));
+        entries.push("RIO_ZSH_ZDOTDIR/pu");
+    }
+    env.push(("WSLENV".into(), entries.join(":")));
+    env
 }
 
 /// The program the PTY will spawn: the configured one, else the same
@@ -308,6 +355,61 @@ mod test {
             "powershell"
         );
         assert_eq!(shell_display_name("PWSH.EXE"), "pwsh");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_environment_preserves_unrelated_forwarding() {
+        let env = wsl_env_pairs(
+            Path::new(r"C:\cache\rio"),
+            Some("COLORTERM/u:ZDOTDIR/p:OTHER/lw:RIO_WSL_INTEGRATION/w"),
+            Some(r"D:\my zsh config".into()),
+        );
+        let value =
+            |key: &str| env.iter().find(|(name, _)| name == key).unwrap().1.as_str();
+        assert_eq!(value("ZDOTDIR"), r"C:\cache\rio\zsh");
+        assert_eq!(value("RIO_ZSH_ZDOTDIR"), r"D:\my zsh config");
+        assert_eq!(
+            value("WSLENV"),
+            "COLORTERM/u:OTHER/lw:ZDOTDIR/pu:RIO_WSL_INTEGRATION/u:RIO_ZSH_ZDOTDIR/pu"
+        );
+        assert!(!wsl_env_pairs(Path::new("cache"), None, None)
+            .iter()
+            .any(|(key, _)| key == "RIO_ZSH_ZDOTDIR"));
+    }
+
+    /// Requires an installed WSL distribution with zsh; optional on other hosts.
+    /// Exercises real Windows -> WSL path translation and zsh startup files.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires WSL with zsh"]
+    fn wsl_zsh_loads_integration_without_user_rc_hook() {
+        let base =
+            std::env::temp_dir().join(format!("rio-si-wsl-test-{}", std::process::id()));
+        materialize(&base).unwrap();
+        let user = base.join("user-config");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join(".zshenv"), "typeset -g RIO_TEST_ENV_LOADED=yes\n")
+            .unwrap();
+        std::fs::write(user.join(".zshrc"), "typeset -g RIO_TEST_RC_LOADED=yes\n")
+            .unwrap();
+        let output = std::process::Command::new("wsl.exe")
+            .args(["--cd", "/home", "--exec", "zsh", "-ic",
+                "_rio_report_pwd; _rio_report_pwd; cd /; _rio_report_pwd; print -r -- CONFIG=$RIO_TEST_ENV_LOADED,$RIO_TEST_RC_LOADED; print -r -- RESTORED=$ZDOTDIR"])
+            .envs(wsl_env_pairs(&base, Some("COLORTERM/u"),
+                Some(user.to_string_lossy().into_owned())))
+            .output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "stdout: {stdout:?}, stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(stdout.matches("\x1b]9;9;").count(), 2, "{stdout:?}");
+        assert!(stdout.contains("\\home\x07"), "{stdout:?}");
+        assert!(stdout.contains("CONFIG=yes,yes"), "{stdout:?}");
+        assert!(stdout.contains("/user-config"), "{stdout:?}");
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
