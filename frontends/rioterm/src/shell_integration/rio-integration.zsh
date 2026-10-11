@@ -13,7 +13,9 @@ if [[ -n "${RIO_WSL_INTEGRATION-}" ]]; then
 fi
 
 _rio_report_pwd() {
-    [[ "${_rio_last_pwd-}" == "$PWD" ]] && return 0
+    # Subshell cd/completion must not replace the parent shell's directory.
+    (( ZSH_SUBSHELL == 0 )) || return 0
+    [[ "${1-}" != force && "${_rio_last_pwd-}" == "$PWD" ]] && return 0
     if [[ -n "$_rio_wsl_distribution" ]]; then
         # Windows Rio needs a local WSL share, including its distribution.
         # Parameter expansion replaces wslpath without forking a process.
@@ -25,7 +27,11 @@ _rio_report_pwd() {
     _rio_last_pwd=$PWD
 }
 
+# A program can report its own cwd while the shell's PWD stays unchanged.
+# Reassert the shell cwd at each prompt, still without spawning a process.
+_rio_precmd_pwd() { _rio_report_pwd force; }
+
 builtin autoload -Uz add-zsh-hook
 add-zsh-hook chpwd _rio_report_pwd
-add-zsh-hook precmd _rio_report_pwd
+add-zsh-hook precmd _rio_precmd_pwd
 _rio_report_pwd

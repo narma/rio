@@ -395,7 +395,7 @@ mod test {
             .unwrap();
         let output = std::process::Command::new("wsl.exe")
             .args(["--cd", "/home", "--exec", "zsh", "-ic",
-                "_rio_report_pwd; _rio_report_pwd; cd /; _rio_report_pwd; print -r -- CONFIG=$RIO_TEST_ENV_LOADED,$RIO_TEST_RC_LOADED; print -r -- RESTORED=$ZDOTDIR"])
+                "_rio_report_pwd; _rio_report_pwd; cd /; _rio_report_pwd; (cd /tmp; _rio_precmd_pwd); print -r -- CONFIG=$RIO_TEST_ENV_LOADED,$RIO_TEST_RC_LOADED; print -r -- RESTORED=$ZDOTDIR"])
             .envs(wsl_env_pairs(&base, Some("COLORTERM/u"),
                 Some(user.to_string_lossy().into_owned())))
             .output().unwrap();
@@ -409,6 +409,28 @@ mod test {
         assert!(stdout.contains("\\home\x07"), "{stdout:?}");
         assert!(stdout.contains("CONFIG=yes,yes"), "{stdout:?}");
         assert!(stdout.contains("/user-config"), "{stdout:?}");
+        // A foreground program may report another cwd. The next prompt
+        // must restore ours even though the shell itself did not cd.
+        let restored = std::process::Command::new("wsl.exe")
+            .args([
+                "--cd",
+                "/home",
+                "--exec",
+                "zsh",
+                "-ic",
+                "printf '\\e]9;9;/tmp\\a'; _rio_precmd_pwd",
+            ])
+            .envs(wsl_env_pairs(
+                &base,
+                None,
+                Some(user.to_string_lossy().into_owned()),
+            ))
+            .output()
+            .unwrap();
+        assert!(restored.status.success());
+        let restored = String::from_utf8_lossy(&restored.stdout);
+        assert_eq!(restored.matches("\x1b]9;9;").count(), 3, "{restored:?}");
+        assert!(restored.ends_with("\\home\x07"), "{restored:?}");
         std::fs::remove_dir_all(&base).unwrap();
     }
 
